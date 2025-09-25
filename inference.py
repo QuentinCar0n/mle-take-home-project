@@ -5,7 +5,7 @@ import numpy as np
 import soundfile as sf
 
 
-HF_TOKEN = "<your-huggingface-token>"
+HF_TOKEN = "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"
 
 
 MODEL_REVISION = "9da79acdd8906c7007242cbd09ed014d265d281a"
@@ -122,7 +122,7 @@ class MinicpmInferenceEngine:
             "time_to_first_byte": time_to_first_byte,
             "total_time": total_time,
             "audio_array": full_audio,
-            "sample_rate": 24000,
+            "sample_rate": 16000,
             "text": text,
         }
     

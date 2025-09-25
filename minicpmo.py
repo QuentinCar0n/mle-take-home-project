@@ -8,7 +8,8 @@ from pydantic import BaseModel, ConfigDict
 import torch
 from transformers import AutoModel, AutoTokenizer
 
-INPUT_OUTPUT_AUDIO_SAMPLE_RATE = 24000
+
+INPUT_OUTPUT_AUDIO_SAMPLE_RATE = 16000
 
 class AudioData(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -19,19 +20,35 @@ class AudioData(BaseModel):
 class MiniCPMo:
     def __init__(self, device: Literal["cpu", "cuda"] = "cuda", model_revision: str = "main"):
         super().__init__()
+        self.device = device
 
-        self.model = (
-            AutoModel.from_pretrained(
+
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        
+       import os
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
+        
+       
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
+        with torch.device(device):
+            self.model = AutoModel.from_pretrained(
                 "openbmb/MiniCPM-o-2_6",
                 trust_remote_code=True,
                 attn_implementation="sdpa",
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float16,
                 revision=model_revision,
                 low_cpu_mem_usage=True,
+                device_map='auto',
+                offload_folder='offload',
+                offload_state_dict=True
             )
-            .eval()
-            .to(device)
-        )
+            
+            self.model.eval()
+            for param in self.model.parameters():
+                param.requires_grad = False
         self._tokenizer = AutoTokenizer.from_pretrained(
             "openbmb/MiniCPM-o-2_6", trust_remote_code=True, revision=model_revision
         )
@@ -43,8 +60,16 @@ class MiniCPMo:
         print("✅ MiniCPMo initialized")
 
     def init_tts(self):
-        self.model.init_tts()
-        self.model.tts.bfloat16()
+        with torch.cuda.amp.autocast(dtype=torch.float16):
+            self.model.init_tts()
+            if hasattr(self.model, 'tts') and self.model.tts is not None:
+                self.model.tts.half()
+                self.model.tts.eval()
+                for param in self.model.tts.parameters():
+                    param.requires_grad = False
+        
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _prefill_audio(
         self,
@@ -87,7 +112,9 @@ class MiniCPMo:
 
                 if audio is not None:
                     resampled_audio = librosa.resample(
-                        audio, audio.sample_rate, 24000
+                        audio, 
+                        orig_sr=audio.sample_rate, 
+                        target_sr=INPUT_OUTPUT_AUDIO_SAMPLE_RATE,
                     )
 
                     self._prefill_audio(
@@ -100,20 +127,37 @@ class MiniCPMo:
 
     def run_inference(self, prefill_data: List[str | AudioData]):
         print("MiniCPMo _run_inference() function called")
-
+        
+      
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            
+        self.model.eval()
+        
         try:
             self.session_id = str(uuid.uuid4())
-
+            
+       
             if prefill_data:
-                self._prefill(data=prefill_data)
-
-
-            response_generator = self.model.streaming_generate(
-                session_id=self.session_id,
-                tokenizer=self._tokenizer,
-                temperature=0.1,
-                generate_audio=self._generate_audio,
-            )
+                with torch.no_grad():
+                    self._prefill(data=prefill_data)
+            
+          
+            generation_config = {
+                'session_id': self.session_id,
+                'tokenizer': self._tokenizer,
+                'temperature': 0.1,  
+                'top_p': 0.9,       
+                'top_k': 50,        
+                'max_new_tokens': 50, 
+                'do_sample': True,   
+                'generate_audio': self._generate_audio,
+                'use_cache': True,  
+                'pad_token_id': self._tokenizer.eos_token_id,
+            }
+            
+            with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
+                response_generator = self.model.streaming_generate(**generation_config)
 
             for response in response_generator:
                 audio = None
