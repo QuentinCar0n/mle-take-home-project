@@ -1,15 +1,16 @@
 import queue
-from typing import List, Literal, Union
+from typing import List, Literal, Union, Optional
 import uuid
+import warnings
 
 import librosa
 import numpy as np
 from pydantic import BaseModel, ConfigDict
 import torch
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, BitsAndBytesConfig
 
 
-INPUT_OUTPUT_AUDIO_SAMPLE_RATE = 16000
+INPUT_OUTPUT_AUDIO_SAMPLE_RATE = 8000
 
 class AudioData(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -18,37 +19,98 @@ class AudioData(BaseModel):
     sample_rate: int
 
 class MiniCPMo:
-    def __init__(self, device: Literal["cpu", "cuda"] = "cuda", model_revision: str = "main"):
+    def __init__(self, device: Literal["cpu", "cuda"] = "cuda", model_revision: str = "main", 
+                 load_in_8bit: bool = True, load_in_4bit: bool = False, 
+                 bnb_4bit_quant_type: str = "nf4", bnb_4bit_compute_dtype: Optional[torch.dtype] = torch.bfloat16):
+        """
+        Initialize MiniCPMo with optional quantization.
+        
+        Args:
+            device: Device to run the model on ('cuda' or 'cpu')
+            model_revision: Model revision to load from Hugging Face Hub
+            load_in_8bit: Whether to load the model in 8-bit precision
+            load_in_4bit: Whether to load the model in 4-bit precision (takes precedence over 8-bit)
+            bnb_4bit_quant_type: Quantization type for 4-bit (either 'fp4' or 'nf4')
+            bnb_4bit_compute_dtype: Compute dtype for 4-bit quantization
+        """
         super().__init__()
         self.device = device
+        self.load_in_8bit = load_in_8bit
+        self.load_in_4bit = load_in_4bit
 
-
+        # Configure PyTorch for better memory usage
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         
-       import os
+        
+        import os
         os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512,expandable_segments:True'
         
        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
+       
+        quantization_config = None
+        torch_dtype = torch.float16
+        
+        if load_in_4bit:
+            if not torch.cuda.is_available():
+                warnings.warn("4-bit quantization requires CUDA. Falling back to 8-bit.")
+                load_in_8bit = True
+                load_in_4bit = False
+            else:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=load_in_4bit,
+                    bnb_4bit_quant_type=bnb_4bit_quant_type,
+                    bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,
+                    bnb_4bit_use_double_quant=True,
+                )
+                torch_dtype = bnb_4bit_compute_dtype or torch.float16
+        elif load_in_8bit:
+            if not torch.cuda.is_available():
+                warnings.warn("8-bit quantization requires CUDA. Falling back to FP16.")
+                load_in_8bit = False
+            else:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=load_in_8bit,
+                )
+        
+       
         with torch.device(device):
-            self.model = AutoModel.from_pretrained(
-                "openbmb/MiniCPM-o-2_6",
-                trust_remote_code=True,
-                attn_implementation="sdpa",
-                torch_dtype=torch.float16,
-                revision=model_revision,
-                low_cpu_mem_usage=True,
-                device_map='auto',
-                offload_folder='offload',
-                offload_state_dict=True
-            )
-            
-            self.model.eval()
-            for param in self.model.parameters():
-                param.requires_grad = False
+            try:
+                self.model = AutoModel.from_pretrained(
+                    "openbmb/MiniCPM-o-2_6",
+                    trust_remote_code=True,
+                    attn_implementation="sdpa",
+                    torch_dtype=torch_dtype,
+                    revision=model_revision,
+                    low_cpu_mem_usage=True,
+                    device_map='auto',
+                    offload_folder='offload',
+                    offload_state_dict=True,
+                    quantization_config=quantization_config
+                )
+                
+               
+                self.model.eval()
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                    
+                print(f"✅ Model loaded in {'4-bit' if load_in_4bit else '8-bit' if load_in_8bit else '16-bit'} precision")
+                
+            except Exception as e:
+                if load_in_4bit or load_in_8bit:
+                    warnings.warn(f"Failed to load quantized model: {str(e)}. Falling back to FP16.")
+                    self.model = AutoModel.from_pretrained(
+                        "openbmb/MiniCPM-o-2_6",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16,
+                        device_map='auto'
+                    )
+                    self.model.eval()
+                else:
+                    raise
         self._tokenizer = AutoTokenizer.from_pretrained(
             "openbmb/MiniCPM-o-2_6", trust_remote_code=True, revision=model_revision
         )
@@ -60,14 +122,20 @@ class MiniCPMo:
         print("✅ MiniCPMo initialized")
 
     def init_tts(self):
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        
+        compute_dtype = torch.bfloat16 if hasattr(self, 'load_in_4bit') and self.load_in_4bit else torch.float16
+        
+        with torch.cuda.amp.autocast(dtype=compute_dtype):
             self.model.init_tts()
             if hasattr(self.model, 'tts') and self.model.tts is not None:
-                self.model.tts.half()
+               
+                if not (hasattr(self, 'load_in_4bit') and self.load_in_4bit) and not (hasattr(self, 'load_in_8bit') and self.load_in_8bit):
+                    self.model.tts = self.model.tts.half()
                 self.model.tts.eval()
                 for param in self.model.tts.parameters():
                     param.requires_grad = False
         
+      
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
@@ -111,10 +179,12 @@ class MiniCPMo:
                     )
 
                 if audio is not None:
+                  
                     resampled_audio = librosa.resample(
                         audio, 
                         orig_sr=audio.sample_rate, 
                         target_sr=INPUT_OUTPUT_AUDIO_SAMPLE_RATE,
+                        res_type='kaiser_fast' 
                     )
 
                     self._prefill_audio(
@@ -128,16 +198,17 @@ class MiniCPMo:
     def run_inference(self, prefill_data: List[str | AudioData]):
         print("MiniCPMo _run_inference() function called")
         
-      
+        
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
             
+      
         self.model.eval()
         
         try:
             self.session_id = str(uuid.uuid4())
             
-       
+          
             if prefill_data:
                 with torch.no_grad():
                     self._prefill(data=prefill_data)
@@ -150,9 +221,9 @@ class MiniCPMo:
                 'top_p': 0.9,       
                 'top_k': 50,        
                 'max_new_tokens': 50, 
-                'do_sample': True,   
+                'do_sample': True,
                 'generate_audio': self._generate_audio,
-                'use_cache': True,  
+                'use_cache': True,
                 'pad_token_id': self._tokenizer.eos_token_id,
             }
             
