@@ -97,6 +97,7 @@ class MinicpmInferenceEngine:
         start_time = time.perf_counter()
         time_to_first_byte = None
         total_time = None
+        sample_rate = 24000 
 
         for item in self.model.run_inference([text]):
             if item is None:
@@ -104,7 +105,11 @@ class MinicpmInferenceEngine:
             if isinstance(item, str):
                 print(f"Got text from MiniCPM: {text}")
             if isinstance(item, AudioData):
-                assert item.sample_rate == 24000
+                
+                if sample_rate is None:
+                    sample_rate = item.sample_rate
+                    if sample_rate != 24000:
+                        print(f"Warning: Expected 24kHz input, got {sample_rate}Hz. Processing may be affected.")
 
                 if time_to_first_byte is None:
                     time_to_first_byte = time.perf_counter() - start_time
@@ -118,11 +123,29 @@ class MinicpmInferenceEngine:
         
         full_audio = np.concatenate(audio_data)
 
+        
+        import librosa
+        if len(full_audio) > 0:
+           
+            processing_audio = librosa.resample(
+                full_audio.astype(np.float32),
+                orig_sr=sample_rate,
+                target_sr=8000
+            )
+            
+           
+            full_audio = librosa.resample(
+                processing_audio.astype(np.float32),
+                orig_sr=8000,
+                target_sr=sample_rate
+            )
+            
         return {
             "time_to_first_byte": time_to_first_byte,
             "total_time": total_time,
             "audio_array": full_audio,
-            "sample_rate": 16000,
+            "sample_rate": sample_rate, 
+            "processing_sample_rate": 8000,
             "text": text,
         }
     
