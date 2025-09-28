@@ -4,7 +4,7 @@ import numpy as np
 import soundfile as sf
 
 # Hugging Face authentication token for accessing private models/repos
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 
 # Specific model version/revision to use
 MODEL_REVISION = "9da79acdd8906c7007242cbd09ed014d265d281a"
@@ -32,7 +32,7 @@ minicpm_inference_engine_image = (
     .run_commands(
         "pip install --upgrade flash_attn==2.8.0.post2"
     )
-    # Install machine learning and data processing libraries
+    # Install machine learning and data processing libraries optimized for speed
     .pip_install(
         "huggingface_hub[hf_transfer]==0.30.1",  # For accessing Hugging Face models
         "transformers==4.44.2",                  # State-of-the-art NLP models
@@ -40,6 +40,7 @@ minicpm_inference_engine_image = (
         "scipy==1.15.2",                         # Scientific computing
         "numpy==1.26.4",                         # Numerical computing
         "pandas==2.2.3",                         # Data manipulation
+        "bitsandbytes>=0.41.0",                  # Updated bitsandbytes for quantization
     ).pip_install(
         "Pillow==10.1.0",                        # Image processing
         "sentencepiece==0.2.0",                  # Tokenization
@@ -57,11 +58,13 @@ minicpm_inference_engine_image = (
     )
     .pip_install("gekko")  # Optimization
     
-    # Configure environment variables
+    # Configure environment variables for maximum performance
     .env({
-        "HF_HUB_ENABLE_HF_TRANSFER": "1",  # Enable faster model downloads
-        "HF_HUB_CACHE": "/cache",          # Cache directory for models
-        "HF_TOKEN": HF_TOKEN,               # Authentication token
+        "HF_HUB_ENABLE_HF_TRANSFER": "1",        # Enable faster model downloads
+        "HF_HUB_CACHE": "/cache",                # Cache directory for models
+        "HF_TOKEN": HF_TOKEN,                    # Authentication token
+        "CUDA_LAUNCH_BLOCKING": "0",             # Allow async CUDA operations for speed
+        "TORCH_CUDNN_V8_API_ENABLED": "1",       # Enable cuDNN v8 API for performance
     })
     # Add local Python module to the image
     .add_local_python_source("minicpmo")
@@ -104,6 +107,10 @@ class MinicpmInferenceEngine:
         self.model = MiniCPMo(device="cuda", model_revision=MODEL_REVISION)
         # Initialize the text-to-speech component
         self.model.init_tts()
+        # Perform warmup at startup instead of first request
+        self.model._warmup()
+        self.model._needs_warmup = False
+        print("✅ Model warmed up and ready for inference")
 
     @modal.method()
     def run(self, text: str):
