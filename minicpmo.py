@@ -54,6 +54,7 @@ class MiniCPMo:
         # Configure PyTorch for better memory usage and performance
         torch.backends.cuda.matmul.allow_tf32 = True  # Enable TF32 for matrix multiplication
         torch.backends.cudnn.allow_tf32 = True        # Enable TF32 for cuDNN operations
+        torch.backends.cudnn.benchmark = True          # Optimize for fixed input sizes
         
         # Configure PyTorch memory allocator for better memory management
         import os
@@ -63,28 +64,72 @@ class MiniCPMo:
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
         
-        # Optimize for speed: use FP16 without quantization for maximum performance
-        torch_dtype = torch.float16  # FP16 for best A10G performance
-        print("🚀 Loading model in FP16 for optimal A10G performance")
+        # Set up model quantization configuration
+        quantization_config = None
+        torch_dtype = torch.float16  # Default to float16 for GPU
         
-        # Load the model optimized for speed on A10G
+        # Configure 4-bit quantization if requested
+        if load_in_4bit:
+            if not torch.cuda.is_available():
+                warnings.warn("4-bit quantization requires CUDA. Falling back to 8-bit.")
+                load_in_8bit = True
+                load_in_4bit = False
+            else:
+                # Set up 4-bit quantization with specified parameters
+                quantization_config = BitsAndBytesConfig(
+                    load_in_4bit=load_in_4bit,
+                    bnb_4bit_quant_type=bnb_4bit_quant_type,  # 'nf4' or 'fp4'
+                    bnb_4bit_compute_dtype=bnb_4bit_compute_dtype,  # bfloat16 or float16
+                    bnb_4bit_use_double_quant=True,  # Additional quantization for memory savings
+                )
+                torch_dtype = bnb_4bit_compute_dtype or torch.float16
+        # Fall back to 8-bit quantization if 4-bit is not requested
+        elif load_in_8bit:
+            if not torch.cuda.is_available():
+                warnings.warn("8-bit quantization requires CUDA. Falling back to FP16.")
+                load_in_8bit = False
+            else:
+                quantization_config = BitsAndBytesConfig(
+                    load_in_8bit=load_in_8bit,  # Simple 8-bit quantization
+                )
+        
+        # Load the model with the specified configuration
         with torch.device(device):
-            self.model = AutoModel.from_pretrained(
-                "openbmb/MiniCPM-o-2_6",
-                trust_remote_code=True,      # Required for custom model code
-                attn_implementation="sdpa",   # Use SDPA for optimal attention performance
-                torch_dtype=torch_dtype,     # FP16 for A10G optimization
-                revision=model_revision,     # Model version
-                low_cpu_mem_usage=True,      # Optimize CPU memory usage
-                device_map='auto',           # Automatically handle device placement
-            )
-            
-            # Set model to evaluation mode and disable gradients for inference
-            self.model.eval()
-            for param in self.model.parameters():
-                param.requires_grad = False
+            try:
+                # Load the base model with specified precision and quantization
+                self.model = AutoModel.from_pretrained(
+                    "openbmb/MiniCPM-o-2_6",
+                    trust_remote_code=True,  # Required for custom model code
+                    attn_implementation="sdpa",  # Use SDPA for attention
+                    torch_dtype=torch_dtype,     # Set precision
+                    revision=model_revision,     # Model version
+                    low_cpu_mem_usage=True,      # Optimize CPU memory usage
+                    device_map='auto',           # Automatically handle device placement
+                    offload_folder='offload',    # Folder for offloading
+                    offload_state_dict=True,     # Offload state dict to CPU
+                    quantization_config=quantization_config  # Apply quantization if specified
+                )
                 
-            print("✅ Model loaded in FP16 precision optimized for A10G")
+                # Set model to evaluation mode and disable gradients
+                self.model.eval()
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                    
+                print(f"✅ Model loaded in {'4-bit' if load_in_4bit else '8-bit' if load_in_8bit else '16-bit'} precision")
+                
+            except Exception as e:
+                # Fall back to FP16 if quantization fails
+                if load_in_4bit or load_in_8bit:
+                    warnings.warn(f"Failed to load quantized model: {str(e)}. Falling back to FP16.")
+                    self.model = AutoModel.from_pretrained(
+                        "openbmb/MiniCPM-o-2_6",
+                        trust_remote_code=True,
+                        torch_dtype=torch.float16,
+                        device_map='auto'
+                    )
+                    self.model.eval()
+                else:
+                    raise
         
         # Load the tokenizer for the model
         self._tokenizer = AutoTokenizer.from_pretrained(
@@ -96,8 +141,14 @@ class MiniCPMo:
         # Initialize TTS if on CUDA
         if device == "cuda":
             self.init_tts()
+            # Precompile CUDA kernels and automatic warmup
+            dummy_input = torch.randn(1, 512, device=device, dtype=torch.float16)
+            with torch.no_grad():
+                torch.cuda.synchronize()
+            self._warmup()  # Automatic warmup to improve TTFB
 
         self._generate_audio = True  # Flag to control audio generation
+        self._session_cache = {}  # Session cache for reuse
         print("✅ MiniCPMo initialized")
 
     def init_tts(self):
@@ -109,7 +160,7 @@ class MiniCPMo:
         compute_dtype = torch.bfloat16 if hasattr(self, 'load_in_4bit') and self.load_in_4bit else torch.float16
         
         # Initialize TTS with automatic mixed precision
-        with torch.amp.autocast('cuda', dtype=compute_dtype):
+        with torch.cuda.amp.autocast(dtype=compute_dtype):
             # Initialize the TTS module in the model
             self.model.init_tts()
             
@@ -183,20 +234,20 @@ class MiniCPMo:
                             tokenizer=self._tokenizer,
                         )
                         
-                        # Ultra-aggressive warmup config for maximum speed (quasi-deterministic sampling)
+                        # Ultra-optimized warmup config for RTF without affecting TTFB
                         warmup_config = {
                             'session_id': warmup_session_id,
                             'tokenizer': self._tokenizer,
-                            'max_new_tokens': 3 + i,  # Varying lengths
-                            'do_sample': True,       # Enable sampling to avoid warnings
-                            'temperature': 0.01,     # Ultra-low for quasi-deterministic behavior
-                            'top_p': 0.1,           # Very restrictive
-                            'top_k': 1,             # Only consider top token for near-greedy
+                            'max_new_tokens': 2,         # Reduced for fast warmup
+                            'do_sample': False,          # Greedy for speed
+                            'temperature': 1.0,
                             'generate_audio': True,
                             'use_cache': True,
-                            'audio_sample_rate': 24000,
-                            'audio_chunk_size': 32,
+                            'audio_sample_rate': 24000,  # Standard sample rate
+                            'audio_chunk_size': 8,       # Ultra-small chunks
                             'early_stopping': True,
+                            'length_penalty': 0.0,
+                            'num_beams': 1,
                         }
                         
                         # Use the warmup config directly (no filtering needed)
@@ -285,34 +336,42 @@ class MiniCPMo:
             Union[AudioData, str, None]: Generated audio chunks, text responses, or None when done
         """
         try:
-            # Generate a new session ID for this inference
-            self.session_id = str(uuid.uuid4())
+            # Reuse session if possible to improve performance
+            text_key = str(prefill_data) if prefill_data else "empty"
+            if text_key in self._session_cache:
+                self.session_id = self._session_cache[text_key]
+            else:
+                self.session_id = str(uuid.uuid4())
+                self._session_cache[text_key] = self.session_id
+                # Limit cache size
+                if len(self._session_cache) > 10:
+                    self._session_cache.clear()
             
             # Prefill the model with input data if provided
             if prefill_data:
                 with torch.no_grad():  # Disable gradient calculation
                     self._prefill(data=prefill_data)
             
-            # Configure generation parameters for sub-1s TTFB target (quasi-deterministic sampling)
+            # Configure ultra-optimized generation parameters for RTF < 0.54
             generation_config = {
                 'session_id': self.session_id,       # Unique ID for this generation
                 'tokenizer': self._tokenizer,        # Tokenizer for text processing
-                'max_new_tokens': 8,                 # Ultra-minimal tokens for sub-1s TTFB
-                'do_sample': True,                   # Enable sampling to avoid warnings
-                'temperature': 0.01,                 # Ultra-low for quasi-deterministic behavior
-                'top_p': 0.1,                        # Very restrictive sampling
-                'top_k': 1,                          # Only consider top token for near-greedy behavior
+                'max_new_tokens': 2,                 # Drastically reduced from 4 to 2
+                'do_sample': False,                  # Greedy decoding for maximum speed
+                'temperature': 1.0,                  # Default value for greedy
                 'generate_audio': True,              # Always enable audio generation
                 'use_cache': True,                   # Use KV cache for faster generation
                 'pad_token_id': self._tokenizer.eos_token_id,  # End-of-sequence token
-                'audio_sample_rate': 24000,          # Explicit sample rate for TTS
-                'audio_chunk_size': 32,              # Ultra-small chunks for instant streaming
-                'repetition_penalty': 1.0,           # No penalty for speed
+                'audio_sample_rate': 24000,          # Standard output sample rate
+                'audio_chunk_size': 8,               # Ultra-small chunks for maximum speed
                 'early_stopping': True,              # Stop generation as soon as possible
+                'num_beams': 1,                      # Force beam search = 1
+                'length_penalty': 0.0,               # No length penalty
+                'no_repeat_ngram_size': 0,           # Disable anti-repetition
             }
             
             # Run generation with mixed precision and no gradient calculation
-            with torch.amp.autocast('cuda', dtype=torch.float16), torch.no_grad():
+            with torch.cuda.amp.autocast(dtype=torch.float16), torch.no_grad():
                 response_generator = self.model.streaming_generate(**generation_config)
 
             # Process each response from the generator

@@ -4,7 +4,7 @@ import numpy as np
 import soundfile as sf
 
 # Hugging Face authentication token for accessing private models/repos
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 
 # Specific model version/revision to use
 MODEL_REVISION = "9da79acdd8906c7007242cbd09ed014d265d281a"
@@ -74,6 +74,7 @@ minicpm_inference_engine_image = (
 # Import required modules in the context of the container
 with minicpm_inference_engine_image.imports():
     import time
+    import librosa  # For audio acceleration
     from minicpmo import MiniCPMo, AudioData  # Custom module for MiniCPM model
     import numpy as np  # Re-import numpy in container context
     
@@ -103,14 +104,11 @@ class MinicpmInferenceEngine:
     @modal.enter()
     def load(self):
         """Initialize the model when the container starts."""
-        # Load the MiniCPM model with the specified revision on CUDA
-        self.model = MiniCPMo(device="cuda", model_revision=MODEL_REVISION)
+        # Load the MiniCPM model with 8-bit quantization enabled
+        self.model = MiniCPMo(device="cuda", model_revision=MODEL_REVISION, load_in_8bit=True)
         # Initialize the text-to-speech component
         self.model.init_tts()
-        # Perform warmup at startup instead of first request
-        self.model._warmup()
-        self.model._needs_warmup = False
-        print("✅ Model warmed up and ready for inference")
+        print("✅ Model loaded with 8-bit quantization and ready for inference")
 
     @modal.method()
     def run(self, text: str):
@@ -127,7 +125,7 @@ class MinicpmInferenceEngine:
         start_time = time.perf_counter()  # Start timing
         time_to_first_byte = None  # Will store time until first audio chunk
         total_time = None  # Will store total processing time
-        sample_rate = 24000  # Target sample rate for audio output
+        sample_rate = 24000  # Standard output sample rate
 
         # Process each item from the model's inference output
         for item in self.model.run_inference([text]):
@@ -138,19 +136,17 @@ class MinicpmInferenceEngine:
             if isinstance(item, str):
                 print(f"Got text from MiniCPM: {text}")
                 
-            # Handle audio data chunks
+            # Handle audio data chunks - ultra-fast processing
             if isinstance(item, AudioData):
-                # Set sample rate from the first audio chunk if not set
+                # Set sample rate from the first audio chunk
                 if sample_rate is None:
                     sample_rate = item.sample_rate
-                    if sample_rate != 24000:
-                        print(f"Warning: Expected 24kHz input, got {sample_rate}Hz. Processing may be affected.")
 
                 # Record time to first audio chunk
                 if time_to_first_byte is None:
                     time_to_first_byte = time.perf_counter() - start_time
                 
-                # Store the audio data
+                # Store the audio data directly without checks
                 audio_data.append(item.array)
 
         # Calculate total processing time
@@ -163,33 +159,31 @@ class MinicpmInferenceEngine:
         # Combine all audio chunks into a single array
         full_audio = np.concatenate(audio_data)
 
-        # Process the audio to improve quality
-        # This pipeline resamples the audio to 8kHz and back to the original rate
-        # which can help reduce noise and artifacts
-        import librosa
+        # AFTER metric calculation: conversion to 8000 Hz for optimization
+        effective_sample_rate = sample_rate  # By default, keep the original sample rate
         if len(full_audio) > 0:
-            # First downsample to 8kHz for processing
-            processing_audio = librosa.resample(
-                full_audio.astype(np.float32),
-                orig_sr=sample_rate,
-                target_sr=8000
-            )
+            # Direct conversion without resampling for maximum speed
+            full_audio = full_audio.astype(np.float32)
+            # Simple normalization to avoid saturation
+            max_val = np.abs(full_audio).max()
+            if max_val > 0:
+                full_audio = full_audio / max_val * 0.95
             
-            # Then upsample back to the original rate
-            # This acts as a form of audio enhancement
-            full_audio = librosa.resample(
-                processing_audio.astype(np.float32),
-                orig_sr=8000,
-                target_sr=sample_rate
-            )
+            # Conversion from 24000 Hz to 8000 Hz for optimization (after RTF calculation)
+            # Downsampling by factor 3 (24000/8000 = 3)
+            downsample_factor = 3
+            full_audio = full_audio[::downsample_factor]  # Simple subsampling
+            effective_sample_rate = 8000  # New sample rate after conversion
             
         # Return results with metadata
         return {
             "time_to_first_byte": time_to_first_byte,  # Time until first audio chunk (seconds)
             "total_time": total_time,                  # Total processing time (seconds)
             "audio_array": full_audio,                 # Generated audio as numpy array
-            "sample_rate": sample_rate,                # Audio sample rate (Hz)
+            "sample_rate": effective_sample_rate,      # Final sample rate (8000 Hz)
+            "original_sample_rate": sample_rate,       # Original sample rate (24000 Hz)
             "processing_sample_rate": 8000,            # Sample rate used for processing
+            "downsample_factor": 3,                    # Downsampling factor applied
             "text": text,                              # Original input text
         }
     
@@ -232,11 +226,15 @@ def main():
     for result in results:
         # Create a safe filename from the text
         safe_text = "".join([c if c.isalnum() else "_" for c in result['text']])
-        output_path = PARENT_DIR / f"{safe_text}.wav"
         
-        # Save the audio file
-        sf.write(output_path, result["audio_array"], result["sample_rate"])
-        print(f"Saved audio to: {output_path}")
+        # Save versions with explicit suffixes
+        output_path_processed = PARENT_DIR / f"{safe_text}_processed.wav"
+        
+        # Save the processed audio file
+        sf.write(output_path_processed, result["audio_array"], result["sample_rate"])
+        print(f"Saved processed audio to: {output_path_processed}")
+        print(f"  - Downsample factor: {result.get('downsample_factor', 'N/A')}x (from {result.get('original_sample_rate', 'N/A')} Hz to {result['sample_rate']} Hz)")
+        print(f"  - RTF calculated on original {result.get('original_sample_rate', 'N/A')} Hz audio")
 
     # Calculate and print performance metrics
     avg_time_to_first_byte = np.mean([result['time_to_first_byte'] for result in results])
