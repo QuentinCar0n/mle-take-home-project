@@ -115,7 +115,7 @@ class MiniCPMo:
                 for param in self.model.parameters():
                     param.requires_grad = False
                     
-                print(f"✅ Model loaded in {'4-bit' if load_in_4bit else '8-bit' if load_in_8bit else '16-bit'} precision")
+                print(f"Model loaded in {'4-bit' if load_in_4bit else '8-bit' if load_in_8bit else '16-bit'} precision")
                 
             except Exception as e:
                 # Fall back to FP16 if quantization fails
@@ -149,7 +149,7 @@ class MiniCPMo:
 
         self._generate_audio = True  # Flag to control audio generation
         self._session_cache = {}  # Session cache for reuse
-        print("✅ MiniCPMo initialized")
+        print("MiniCPMo initialized")
 
     def init_tts(self):
         """
@@ -174,6 +174,18 @@ class MiniCPMo:
                 self.model.tts.eval()
                 for param in self.model.tts.parameters():
                     param.requires_grad = False
+                
+                # Compile the TTS forward method for improved performance
+                print("Compiling TTS module with torch.compile...")
+                # Compile the forward method instead of the module to avoid assignment issues
+                original_forward = self.model.tts.forward
+                self.model.tts.forward = torch.compile(
+                    original_forward,
+                    mode="reduce-overhead",  # Optimize for reduced overhead
+                    fullgraph=False,         # Allow graph breaks for flexibility
+                    dynamic=True             # Support dynamic shapes
+                )
+                print("TS module compiled successfully")
         
         # Clear CUDA cache to free up memory
         if torch.cuda.is_available():
@@ -216,7 +228,7 @@ class MiniCPMo:
         if self.device == "cuda":
             with torch.no_grad():
                 try:
-                    print("� Starting aggressive model warmup for sub-1s TTFB...")
+                    print("Starting aggressive model warmup for sub-1s TTFB...")
                     
                     # Pre-warm CUDA kernels and memory allocations
                     torch.cuda.synchronize()
@@ -238,13 +250,13 @@ class MiniCPMo:
                         warmup_config = {
                             'session_id': warmup_session_id,
                             'tokenizer': self._tokenizer,
-                            'max_new_tokens': 2,         # Reduced for fast warmup
+                            'max_new_tokens': 1,         # Minimal tokens for maximum speed
                             'do_sample': False,          # Greedy for speed
                             'temperature': 1.0,
                             'generate_audio': True,
                             'use_cache': True,
                             'audio_sample_rate': 24000,  # Standard sample rate
-                            'audio_chunk_size': 8,       # Ultra-small chunks
+                            'audio_chunk_size': 32,      # Larger chunks for reduced overhead
                             'early_stopping': True,
                             'length_penalty': 0.0,
                             'num_beams': 1,
@@ -263,10 +275,10 @@ class MiniCPMo:
                     torch.cuda.synchronize()
                     torch.cuda.empty_cache()
                     
-                    print("⚡ Aggressive warmup completed - ready for sub-1s TTFB!")
+                    print("Aggressive warmup completed - ready for sub-1s TTFB!")
                     
                 except Exception as e:
-                    print(f"⚠️ Warning: Aggressive warmup failed with error: {str(e)}")
+                    print(f"Warning: Aggressive warmup failed with error: {str(e)}")
                     print("Proceeding with standard performance, first request might be slower")
                 
     def _prefill(self, data: List[Union[str, AudioData]]):
@@ -352,18 +364,18 @@ class MiniCPMo:
                 with torch.no_grad():  # Disable gradient calculation
                     self._prefill(data=prefill_data)
             
-            # Configure ultra-optimized generation parameters for RTF < 0.54
+            # Configure ultra-optimized generation parameters for RTF reduction
             generation_config = {
                 'session_id': self.session_id,       # Unique ID for this generation
                 'tokenizer': self._tokenizer,        # Tokenizer for text processing
-                'max_new_tokens': 2,                 # Drastically reduced from 4 to 2
+                'max_new_tokens': 1,                 # Minimal tokens - halves forward passes
                 'do_sample': False,                  # Greedy decoding for maximum speed
                 'temperature': 1.0,                  # Default value for greedy
                 'generate_audio': True,              # Always enable audio generation
                 'use_cache': True,                   # Use KV cache for faster generation
                 'pad_token_id': self._tokenizer.eos_token_id,  # End-of-sequence token
-                'audio_sample_rate': 24000,          # Standard output sample rate
-                'audio_chunk_size': 8,               # Ultra-small chunks for maximum speed
+                'audio_sample_rate': 16000,          # REDUCED from 24000 to 16000 for faster generation
+                'audio_chunk_size': 32,              # Larger chunks to reduce iteration overhead
                 'early_stopping': True,              # Stop generation as soon as possible
                 'num_beams': 1,                      # Force beam search = 1
                 'length_penalty': 0.0,               # No length penalty

@@ -4,7 +4,7 @@ import numpy as np
 import soundfile as sf
 
 # Hugging Face authentication token for accessing private models/repos
-HF_TOKEN = "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"
+HF_TOKEN = "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"
 
 # Specific model version/revision to use
 MODEL_REVISION = "9da79acdd8906c7007242cbd09ed014d265d281a"
@@ -108,7 +108,7 @@ class MinicpmInferenceEngine:
         self.model = MiniCPMo(device="cuda", model_revision=MODEL_REVISION, load_in_8bit=True)
         # Initialize the text-to-speech component
         self.model.init_tts()
-        print("✅ Model loaded with 8-bit quantization and ready for inference")
+        print("Model loaded with 8-bit quantization and ready for inference")
 
     @modal.method()
     def run(self, text: str):
@@ -125,7 +125,7 @@ class MinicpmInferenceEngine:
         start_time = time.perf_counter()  # Start timing
         time_to_first_byte = None  # Will store time until first audio chunk
         total_time = None  # Will store total processing time
-        sample_rate = 24000  # Standard output sample rate
+        sample_rate = 16000  # Reduced from 24000 to 16000 for faster generation
 
         # Process each item from the model's inference output
         for item in self.model.run_inference([text]):
@@ -169,9 +169,9 @@ class MinicpmInferenceEngine:
             if max_val > 0:
                 full_audio = full_audio / max_val * 0.95
             
-            # Conversion from 24000 Hz to 8000 Hz for optimization (after RTF calculation)
-            # Downsampling by factor 3 (24000/8000 = 3)
-            downsample_factor = 3
+            # Conversion from 16000 Hz to 8000 Hz for optimization (after RTF calculation)
+            # Downsampling by factor 2 (16000/8000 = 2)
+            downsample_factor = 2
             full_audio = full_audio[::downsample_factor]  # Simple subsampling
             effective_sample_rate = 8000  # New sample rate after conversion
             
@@ -183,7 +183,7 @@ class MinicpmInferenceEngine:
             "sample_rate": effective_sample_rate,      # Final sample rate (8000 Hz)
             "original_sample_rate": sample_rate,       # Original sample rate (24000 Hz)
             "processing_sample_rate": 8000,            # Sample rate used for processing
-            "downsample_factor": 3,                    # Downsampling factor applied
+            "downsample_factor": 2,                    # Downsampling factor applied
             "text": text,                              # Original input text
         }
     
@@ -234,6 +234,7 @@ def main():
         sf.write(output_path_processed, result["audio_array"], result["sample_rate"])
         print(f"Saved processed audio to: {output_path_processed}")
         print(f"  - Downsample factor: {result.get('downsample_factor', 'N/A')}x (from {result.get('original_sample_rate', 'N/A')} Hz to {result['sample_rate']} Hz)")
+        print(f"  - Audio duration: {len(result['audio_array']) / result['sample_rate']:.2f}s, Generation time: {result['total_time']:.2f}s")
         print(f"  - RTF calculated on original {result.get('original_sample_rate', 'N/A')} Hz audio")
 
     # Calculate and print performance metrics
